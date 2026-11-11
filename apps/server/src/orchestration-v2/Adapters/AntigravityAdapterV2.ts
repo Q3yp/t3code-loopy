@@ -39,6 +39,8 @@ import {
   antigravitySubagentOutput,
   classifyAntigravitySubagentToolCall,
   extractAntigravityUserInputQuestion,
+  isAntigravityForegroundCommand,
+  isAntigravityForegroundCommandOpen,
   makeAntigravityReadRepair,
   makeAntigravityUserInputResponse,
   normalizeAntigravityToolCall,
@@ -52,6 +54,12 @@ import {
 } from "@t3tools/provider-acp/server/adapter";
 
 const ANTIGRAVITY_PROVIDER = ProviderDriverKind.make("antigravity");
+
+// Over ACP, ending `session/prompt` detaches Antigravity's update and permission streams
+// before a backgrounded `run_command` finishes, stranding its wakeup without a listener.
+const ANTIGRAVITY_BACKGROUND_WAIT_INSTRUCTIONS = `### Background commands you wait on
+
+Over ACP, ending your turn closes T3 Code's active stream before a backgrounded \`run_command\` can report back. When a foreground \`run_command\` (\`IsDaemon\` false) moves to the background with a task ID (\`<session>/task-<n>\`), ignore any prompt to end your turn: call \`t3_background_wait\` with \`taskIds: ["<session>/task-<n>"]\` instead (and call it again if it returns before \`<SYSTEM_MESSAGE>\` arrives). Pass \`waiting: false\` only for processes you leave running (dev servers, watchers).`;
 
 const AntigravityProviderCapabilitiesV2 = {
   ...AcpProviderCapabilitiesV2,
@@ -179,7 +187,10 @@ export function makeAntigravityAcpAdapterFlavor(
             ),
           ),
         prompt: (payload, promptOptions) =>
-          Effect.sync(reads.reset).pipe(Effect.andThen(runtime.prompt(payload, promptOptions))),
+          Effect.sync(reads.reset).pipe(
+            Effect.andThen(runtime.prompt(payload, promptOptions)),
+            Effect.tap(() => updates.withPermit(Effect.void)),
+          ),
         handleSessionUpdate: (handler) => {
           projectUpdate = handler;
           return runtime.handleSessionUpdate((notification) =>
@@ -210,6 +221,27 @@ export function makeAntigravityAcpAdapterFlavor(
     capabilities: AntigravityProviderCapabilitiesV2,
     // Agents that advertise HTTP MCP skip the stdio bridge process; others keep stdio.
     mcpOverHttp: true,
+    mcpInstructions: ANTIGRAVITY_BACKGROUND_WAIT_INSTRUCTIONS,
+    foregroundCommandWait: {
+      isOpenForegroundCommand: isAntigravityForegroundCommandOpen,
+      isForegroundCommand: isAntigravityForegroundCommand,
+      buildContinuationPrompt: (openTools, { hasT3Mcp }) => {
+        const commands = openTools
+          .map((tool) => tool.command ?? tool.title)
+          .filter((value): value is string => Boolean(value?.trim()))
+          .slice(0, 3);
+        const summary = commands.length > 0 ? ` (${commands.join("; ")})` : "";
+        const waitInstruction = hasT3Mcp
+          ? "If it is still running, call `t3_background_wait` with its task ID until its `<SYSTEM_MESSAGE>` completion arrives, or pass `waiting: false` only if it is meant to stay running in the background."
+          : "If it is still running, wait for its `<SYSTEM_MESSAGE>` completion in this turn before ending your turn.";
+        return [
+          {
+            type: "text",
+            text: `<t3_background_continuation>\nForeground command work started in this turn${summary} was still running when your turn ended. ${waitInstruction} Once its output arrives, continue and finish the user's request.\n</t3_background_continuation>`,
+          },
+        ];
+      },
+    },
     sessionCarriesPullRequestLinking: antigravityAppendsSystemPrompt,
     makeRuntime,
     buildPrompt: ({
